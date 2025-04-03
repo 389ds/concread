@@ -6,6 +6,8 @@
 
 use crate::internals::lincowcell::LinCowCellCapable;
 
+use sptr::Strict;
+
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, VecDeque};
