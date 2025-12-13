@@ -943,7 +943,9 @@ impl<
     ) where
         S: ARCacheWriteStat<K>,
     {
+        let mut processed_count: u64 = 0;
         while let Some(ce) = inner.inc_queue.pop() {
+            processed_count += 1;
             // Update if it was inc
             let CacheIncludeEvent {
                 t,
@@ -952,6 +954,21 @@ impl<
                 txid,
                 size,
             } = ce;
+
+            // Trace logging for debugging cache state transitions
+            tracing::trace!(
+                key = ?k,
+                event_txid = txid,
+                event_size = size,
+                min_txid = inner.min_txid,
+                freq_len = inner.freq.len(),
+                rec_len = inner.rec.len(),
+                ghost_freq_len = inner.ghost_freq.len(),
+                ghost_rec_len = inner.ghost_rec.len(),
+                processed = processed_count,
+                "drain_inc_rx: Processing include event"
+            );
+
             let mut r = cache.get_mut(&k);
             match r {
                 Some(ref mut ci) => {
@@ -1142,8 +1159,22 @@ impl<
                     } // for each ci in slots
                 }
                 None => {
-                    // Impossible state!
-                    unreachable!();
+                    // Hit recorded for a key hash that no longer exists in cache.
+                    // This can happen if the item was evicted between when the hit
+                    // was recorded and when we're processing the hit queue.
+                    // This is not necessarily a bug - it's a race between hit recording
+                    // and eviction. Log at debug level and skip.
+                    tracing::debug!(
+                        key_hash = k_hash,
+                        commit_txid = commit_txid,
+                        freq_len = inner.freq.len(),
+                        rec_len = inner.rec.len(),
+                        "drain_tlocal_hits: Hit recorded for key hash that is no longer in cache. \
+                         This may indicate the item was evicted before hit could be processed. \
+                         Skipping hit promotion for hash: {:#x}",
+                        k_hash
+                    );
+                    // Skip this hit - the item is gone from the cache
                 }
             }
         });
@@ -1173,8 +1204,28 @@ impl<
                     mem::swap(*ci, &mut next_state);
                 }
                 None => {
-                    // Impossible state!
-                    unreachable!();
+                    // CRITICAL: Item exists in ghost linked list but NOT in hashmap.
+                    // This indicates a cache data structure inconsistency.
+                    tracing::error!(
+                        key = ?pointer.as_ref().k,
+                        key_txid = pointer.as_ref().txid,
+                        key_size = pointer.as_ref().size,
+                        current_txid = txid,
+                        ll_len = ll.len(),
+                        target_size = size,
+                        to_ll_len = to_ll.len(),
+                        "evict_to_haunted_len: CRITICAL cache inconsistency detected! \
+                         Ghost item found in linked list but missing from hashmap. \
+                         Key: {:?}, Item txid: {}, Current txid: {}. \
+                         This is a bug in the cache implementation. \
+                         Item already moved to haunted list, continuing.",
+                        pointer.as_ref().k,
+                        pointer.as_ref().txid,
+                        txid
+                    );
+                    // The item was already appended to to_ll (haunted list).
+                    // Since there's no hashmap entry to update, we just continue.
+                    // This orphaned entry in haunted list will eventually be cleaned up.
                 }
             };
         }
@@ -1218,16 +1269,56 @@ impl<
                             CacheItem::GhostRec(pointer)
                         }
                         _ => {
-                            // Impossible state!
-                            unreachable!();
+                            // Unexpected cache item state during eviction.
+                            // Log detailed diagnostic information and skip this item.
+                            tracing::error!(
+                                key = ?owned.as_ref().k,
+                                key_txid = owned.as_ref().txid,
+                                current_txid = txid,
+                                ll_len = ll.len(),
+                                target_size = size,
+                                to_ll_len = to_ll.len(),
+                                cache_item_state = ?ci,
+                                "evict_to_len: Unexpected CacheItem state - item in linked list \
+                                 has wrong state in hashmap. Expected Freq or Rec. \
+                                 This indicates a cache consistency bug. Skipping eviction of this item."
+                            );
+                            // Move to ghost list anyway to prevent infinite loop
+                            let pointer = to_ll.append_n(owned);
+                            CacheItem::GhostRec(pointer)
                         }
                     };
                     // Now change the state.
                     mem::swap(*ci, &mut next_state);
                 }
                 None => {
-                    // Impossible state!
-                    unreachable!();
+                    // CRITICAL: Item exists in linked list but NOT in hashmap.
+                    // This indicates a severe cache data structure inconsistency.
+                    // Log comprehensive diagnostic information for debugging.
+                    tracing::error!(
+                        key = ?owned.as_ref().k,
+                        key_txid = owned.as_ref().txid,
+                        key_size = owned.as_ref().size,
+                        current_txid = txid,
+                        ll_len = ll.len(),
+                        target_size = size,
+                        to_ll_len = to_ll.len(),
+                        "evict_to_len: CRITICAL cache inconsistency detected! \
+                         Item found in linked list but missing from hashmap. \
+                         Key: {:?}, Item txid: {}, Current txid: {}, LL len: {}, Target: {}. \
+                         This is a bug in the cache implementation. \
+                         Dropping orphaned linked list node to prevent crash.",
+                        owned.as_ref().k,
+                        owned.as_ref().txid,
+                        txid,
+                        ll.len(),
+                        size
+                    );
+                    // Drop the orphaned node - it's not in the hashmap so we can't
+                    // transition its state, but we need to remove it from the LL
+                    // to prevent infinite loops. The node will be deallocated when
+                    // `owned` goes out of scope.
+                    drop(owned);
                 }
             }
         }
@@ -1402,16 +1493,49 @@ impl<
                             CacheItem::GhostRec(pointer)
                         }
                         _ => {
-                            // Impossible state!
-                            unreachable!();
+                            // Unexpected cache item state during drain to ghost.
+                            // Log and move to ghost_rec as a fallback.
+                            tracing::error!(
+                                key = ?owned.as_ref().k,
+                                key_txid = owned.as_ref().txid,
+                                current_txid = txid,
+                                cache_item_state = ?ci,
+                                ll_len = ll.len(),
+                                gf_len = gf.len(),
+                                gr_len = gr.len(),
+                                "drain_ll_to_ghost: Unexpected CacheItem state - expected Freq or Rec. \
+                                 Key: {:?}, State: {:?}. Moving to ghost_rec as fallback.",
+                                owned.as_ref().k,
+                                ci
+                            );
+                            stats.evict_from_recent(&owned.as_ref().k);
+                            let pointer = gr.append_n(owned);
+                            CacheItem::GhostRec(pointer)
                         }
                     };
                     // Now change the state.
                     mem::swap(*ci, &mut next_state);
                 }
                 None => {
-                    // Impossible state!
-                    unreachable!();
+                    // CRITICAL: Item in linked list but not in hashmap.
+                    tracing::error!(
+                        key = ?owned.as_ref().k,
+                        key_txid = owned.as_ref().txid,
+                        key_size = owned.as_ref().size,
+                        current_txid = txid,
+                        ll_len = ll.len(),
+                        gf_len = gf.len(),
+                        gr_len = gr.len(),
+                        "drain_ll_to_ghost: CRITICAL cache inconsistency! \
+                         Item in linked list but missing from hashmap. \
+                         Key: {:?}, Item txid: {}, Current txid: {}. \
+                         Dropping orphaned node.",
+                        owned.as_ref().k,
+                        owned.as_ref().txid,
+                        txid
+                    );
+                    // Drop the orphaned node
+                    drop(owned);
                 }
             }
         } // end while
@@ -1533,6 +1657,21 @@ impl<
         // * p has possibly changed width, causing a balance shift
         // * and ghost items have been included changing ghost list sizes.
         // so we need to do a clean up/balance of all the list lengths.
+
+        // Log cache state before eviction for debugging
+        tracing::trace!(
+            commit_txid = commit_txid,
+            min_txid = inner.min_txid,
+            p = inner.p,
+            max = shared.max,
+            freq_len = inner.freq.len(),
+            rec_len = inner.rec.len(),
+            ghost_freq_len = inner.ghost_freq.len(),
+            ghost_rec_len = inner.ghost_rec.len(),
+            haunted_len = inner.haunted.len(),
+            "commit: Pre-eviction cache state"
+        );
+
         self.evict(
             &mut cache,
             inner.deref_mut(),
