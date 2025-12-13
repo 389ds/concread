@@ -148,6 +148,18 @@ where
     pub fn is_null(&self) -> bool {
         self.inner.is_null()
     }
+
+    /// Safely dispose of an orphaned LLNodeOwned without panicking.
+    /// This should only be used when the node has been popped from a linked list
+    /// but cannot be added to another list (e.g., due to cache inconsistency).
+    /// The node's memory will be properly deallocated.
+    pub(crate) fn dispose(mut self) {
+        if !self.inner.is_null() {
+            let ptr = self.into_inner();
+            LLNode::free(ptr);
+        }
+        // self.inner is now null, so Drop won't panic
+    }
 }
 
 impl<K> PartialEq for &LLNodeOwned<K>

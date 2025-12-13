@@ -1314,11 +1314,10 @@ impl<
                         ll.len(),
                         size
                     );
-                    // Drop the orphaned node - it's not in the hashmap so we can't
-                    // transition its state, but we need to remove it from the LL
-                    // to prevent infinite loops. The node will be deallocated when
-                    // `owned` goes out of scope.
-                    drop(owned);
+                    // Properly dispose of the orphaned node - it's not in the hashmap
+                    // so we can't transition its state. Use dispose() to safely
+                    // deallocate without triggering the Drop panic.
+                    owned.dispose();
                 }
             }
         }
@@ -1529,13 +1528,13 @@ impl<
                         "drain_ll_to_ghost: CRITICAL cache inconsistency! \
                          Item in linked list but missing from hashmap. \
                          Key: {:?}, Item txid: {}, Current txid: {}. \
-                         Dropping orphaned node.",
+                         Disposing orphaned node.",
                         owned.as_ref().k,
                         owned.as_ref().txid,
                         txid
                     );
-                    // Drop the orphaned node
-                    drop(owned);
+                    // Properly dispose of the orphaned node
+                    owned.dispose();
                 }
             }
         } // end while
